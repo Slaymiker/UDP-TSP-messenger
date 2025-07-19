@@ -1,0 +1,140 @@
+import socket
+import threading
+import queue
+
+# ==== Настройки ====
+TCP_HOST = '26.46.53.93'
+TCP_PORT = 8080
+UDP_PORT = 8081
+
+CHUNK = 1024
+FORMAT = 'int16'
+CHANNELS = 1
+RATE = 44100
+
+# ==== Глобальные переменные ====
+clients = {}  # {tcp_socket: name}
+voice_channels = {}  # {channel_id: [udp_addr]}
+lock = threading.Lock()
+client_udp_map = {}  # {name: udp_address}
+
+# ==== TCP сервер ====
+def start_tcp_server():
+    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_sock.bind((TCP_HOST, TCP_PORT))
+    server_sock.listen(5)
+    print(f"TCP сервер запущен на порту {TCP_PORT}...")
+
+    while True:
+        client, addr = server_sock.accept()
+        print(f"Новое TCP подключение: {addr}")
+        threading.Thread(target=handle_client, args=(client,), daemon=True).start()
+
+# ==== Обработка клиентов ====
+def handle_client(client_sock):
+    try:
+        name = client_sock.recv(1024).decode('utf-8', errors='replace').strip()
+        if not name:
+            raise ValueError("Пустое имя")
+        clients[client_sock] = name
+        print(f"{name} подключён.")
+        broadcast_message(f"[SERVER] {name} вошёл в чат.")
+
+        while True:
+            data = client_sock.recv(1024)
+            if not data:
+                break
+            message = data.decode('utf-8', errors='replace').strip()
+
+            if message.startswith("/create_voice_channel"):
+                channel_id = create_voice_channel()
+                broadcast_message(f"[SERVER] Голосовой канал {channel_id} создан. Используйте '/join {channel_id}'.")
+
+            elif message.startswith("/join"):
+                try:
+                    _, channel_id = message.split()
+                    channel_id = int(channel_id)
+                    if channel_id in voice_channels:
+                        client_sock.sendall(f"[VOICE] Вы присоединились к каналу {channel_id}. Укажите свой UDP-порт.".encode('utf-8'))
+                    else:
+                        client_sock.sendall(f"[ERROR] Канал {channel_id} не существует.".encode('utf-8'))
+                except Exception as e:
+                    client_sock.sendall("[USAGE] /join <id>".encode('utf-8'))
+
+            elif message.startswith("/udp"):
+                try:
+                    _, udp_port = message.split()
+                    udp_port = int(udp_port)
+                    with lock:
+                        client_udp_map[clients[client_sock]] = ('0.0.0.0', udp_port)
+                    client_sock.sendall(f"[VOICE] Ваши UDP данные будут отправлены на порт {udp_port}".encode('utf-8'))
+                    print(f"{clients[client_sock]} указал UDP порт: {udp_port}")
+                except Exception as e:
+                    client_sock.sendall("[USAGE] /udp <port>".encode('utf-8'))
+
+            else:
+                full_msg = f"{name}: {message}"
+                broadcast_message(full_msg)
+
+    except Exception as e:
+        print(f"Ошибка с клиентом {name}: {e}")
+    finally:
+        with lock:
+            if client_sock in clients:
+                del clients[client_sock]
+        broadcast_message(f"[SERVER] {name} покинул чат.")
+        try:
+            client_sock.close()
+        except:
+            pass
+
+def broadcast_message(message):
+    for sock in list(clients.keys()):
+        try:
+            sock.sendall(message.encode('utf-8'))
+        except:
+            pass
+
+def create_voice_channel():
+    with lock:
+        channel_id = len(voice_channels) + 1
+        voice_channels[channel_id] = []
+        return channel_id
+
+# ==== UDP сервер для голоса ====
+def start_udp_server():
+    udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_sock.bind(('0.0.0.0', UDP_PORT))
+    print(f"UDP сервер запущен на порту {UDP_PORT}...")
+
+    while True:
+        data, addr = udp_sock.recvfrom(65536)
+        # Получаем имя пользователя по UDP адресу (можно улучшить логику)
+        name = next((n for n, a in client_udp_map.items() if a == addr), None)
+        if name:
+            forward_audio(name, data, addr)
+
+def forward_audio(name, audio_data, from_addr):
+    print(f"Пересылаю аудио от {name}")
+    with lock:
+        for channel in voice_channels.values():
+            for user in channel:
+                if user != name and user in client_udp_map:
+                    to_addr = client_udp_map[user]
+                    try:
+                        udp_out.sendto(audio_data, to_addr)
+                    except Exception as e:
+                        print(f"Ошибка при отправке аудио пользователю {user}: {e}")
+
+# ==== Отправка UDP пакетов ====
+udp_out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+# ==== Запуск сервера ====
+if __name__ == "__main__":
+    threading.Thread(target=start_tcp_server, daemon=True).start()
+    threading.Thread(target=start_udp_server, daemon=True).start()
+    try:
+        while True:
+            pass
+    except KeyboardInterrupt:
+        print("Сервер остановлен.")
